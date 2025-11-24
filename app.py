@@ -243,7 +243,7 @@ if audio_input is not None:
                 half_new_duration = len(adjusted_audio) / 2
                 
                 # 計算新的開始時間 = 中心點 - 新片段的一半 + 手動延遲
-                final_position_ms = int(original_center - half_new_duration + manual_delay_ms)
+                final_position_ms = int(original_center)
                 
                 # 防呆：不能小於 0
                 final_position_ms = max(0, final_position_ms)
