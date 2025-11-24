@@ -109,6 +109,7 @@ if audio_input is not None:
         progress_bar = st.progress(0)
 
         try:
+            try:
             # Step 1: 讀取與轉檔 (解決 iOS 問題的關鍵!)
             status_text.text("正在處理音訊格式 (兼容 iOS)...")
             progress_bar.progress(5)
@@ -134,6 +135,40 @@ if audio_input is not None:
                 st.error(f"音訊格式轉換失敗，請確認是否已安裝 ffmpeg。錯誤: {e}")
                 st.stop()
 
+            # Step 2: ASR 識別 (使用乾淨的 WAV)
+            status_text.text("正在識別語音內容 (Google ASR)...")
+            progress_bar.progress(10)
+            
+            audio = speech.RecognitionAudio(content=clean_wav_bytes)
+            
+            # 因為我們已經強制轉成 16kHz WAV，這裡可以直接指定 config，不用自動偵測了
+            config = speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=16000, 
+                language_code="zh-TW",
+                enable_word_time_offsets=True,
+                enable_automatic_punctuation=True,
+            )
+
+            operation = speech_client.recognize(config=config, audio=audio)
+            
+            if not operation.results:
+                st.warning("沒有偵測到清晰的語音，請再試一次。")
+                st.stop()
+
+            result = operation.results[0].alternatives[0]
+            transcript = result.transcript
+            
+            asr_words_data = []
+            for word_info in result.words:
+                asr_words_data.append({
+                    "word": word_info.word.strip(),
+                    "start_time": word_info.start_time,
+                    "end_time": word_info.end_time
+                })
+            
+            st.info(f"識別內容: {transcript}")
+            progress_bar.progress(30)
             # Step 2: LLM
             status_text.text("AI 正在審查情緒詞彙...")
             
