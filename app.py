@@ -232,10 +232,6 @@ if audio_input is not None:
                 # 4-4. 音量增強
                 adjusted_audio = adjusted_audio + volume_boost
                 
-                # 4-5. 靜音原始片段 (Censor 的必要步驟)
-                # 我們先將原本罵人的地方變成靜音
-                silence = AudioSegment.silent(duration=original_duration_ms)
-                final_audio = final_audio[:original_start_ms] + silence + final_audio[original_end_ms:]
                 
                 # 4-6. 置中對齊計算 (Centering Logic)
                 # 目標：讓 adjusted_audio 的中心點，對齊原本片段的中心點
