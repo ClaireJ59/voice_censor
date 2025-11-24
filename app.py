@@ -109,41 +109,30 @@ if audio_input is not None:
         progress_bar = st.progress(0)
 
         try:
-            # Step 1: ASR
-            status_text.text("正在聆聽並識別語音 (ASR)...")
-            progress_bar.progress(10)
+            # Step 1: 讀取與轉檔 (解決 iOS 問題的關鍵!)
+            status_text.text("正在處理音訊格式 (兼容 iOS)...")
+            progress_bar.progress(5)
             
             audio_input.seek(0)
-            audio_bytes = audio_input.read()
+            raw_audio_bytes = audio_input.read()
             
-            audio = speech.RecognitionAudio(content=audio_bytes)
-            config = speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED, 
-                sample_rate_hertz=0, 
-                language_code="zh-TW",
-                enable_word_time_offsets=True,
-                enable_automatic_punctuation=True,
-            )
-
-            operation = speech_client.recognize(config=config, audio=audio)
-            
-            if not operation.results:
-                st.warning("沒有偵測到清晰的語音。")
+            # 1-1. 使用 pydub 將任何格式 (m4a, mp4, webm) 強制轉為 WAV
+            # 這是因為 Google ASR 不支援 iOS 預設的 m4a 格式
+            try:
+                # from_file 會自動偵測輸入格式 (需依賴 ffmpeg)
+                input_audio = AudioSegment.from_file(io.BytesIO(raw_audio_bytes))
+                
+                # 轉為單聲道 (Mono) + 16kHz (Google ASR 推薦格式)
+                input_audio = input_audio.set_channels(1).set_frame_rate(16000)
+                
+                # 匯出成 bytes
+                wav_buffer = io.BytesIO()
+                input_audio.export(wav_buffer, format="wav")
+                clean_wav_bytes = wav_buffer.getvalue()
+                
+            except Exception as e:
+                st.error(f"音訊格式轉換失敗，請確認是否已安裝 ffmpeg。錯誤: {e}")
                 st.stop()
-
-            result = operation.results[0].alternatives[0]
-            transcript = result.transcript
-            
-            asr_words_data = []
-            for word_info in result.words:
-                asr_words_data.append({
-                    "word": word_info.word.strip(),
-                    "start_time": word_info.start_time,
-                    "end_time": word_info.end_time
-                })
-            
-            st.info(f"識別內容: {transcript}")
-            progress_bar.progress(30)
 
             # Step 2: LLM
             status_text.text("AI 正在審查情緒詞彙...")
