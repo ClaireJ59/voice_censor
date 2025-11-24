@@ -108,10 +108,33 @@ def perform_sliding_window_match(asr_words: list, replacement_map: dict) -> list
     return final_logs
 
 # --- 主介面 ---
-uploaded_file = st.file_uploader("請選擇音訊檔案 (WAV, MP3, WEBM)", type=["wav", "mp3", "webm", "m4a"])
+st.subheader("請選擇輸入方式")
 
-if uploaded_file is not None:
-    st.audio(uploaded_file, format='audio/audio', start_time=0)
+# 建立兩個分頁：錄音 vs 上傳
+tab1, tab2 = st.tabs(["🎤 現場錄音", "📂 上傳檔案"])
+
+audio_input = None
+source_type = ""
+
+# 分頁 1: 錄音
+with tab1:
+    recorded_audio = st.audio_input("點擊下方麥克風開始錄音")
+    if recorded_audio:
+        audio_input = recorded_audio
+        source_type = "recording"
+
+# 分頁 2: 上傳
+with tab2:
+    uploaded_file = st.file_uploader("選擇音訊檔案", type=["wav", "mp3", "webm", "m4a"])
+    if uploaded_file:
+        audio_input = uploaded_file
+        source_type = "upload"
+
+# --- 開始處理邏輯 ---
+# 只有當偵測到有音訊輸入 (不論是錄音還是上傳) 才顯示按鈕
+if audio_input is not None:
+    # 預先播放給使用者聽
+    st.audio(audio_input, format='audio/wav') # 錄音預設是 wav
     
     if st.button("🚀 開始轉換", type="primary"):
         status_text = st.empty()
@@ -122,11 +145,19 @@ if uploaded_file is not None:
             status_text.text("正在進行語音識別 (ASR)...")
             progress_bar.progress(10)
             
-            audio_content = uploaded_file.read()
+            # 讀取 bytes
+            # 注意: st.audio_input 回傳的指針可能在最後，建議先 seek(0)
+            audio_input.seek(0)
+            audio_content = audio_input.read()
+            
             audio = speech.RecognitionAudio(content=audio_content)
+            
+            # [重要修改] 更改 ASR Config 以兼容錄音檔(WAV)和上傳檔
+            # 瀏覽器錄音通常是 WAV (Linear PCM)，不能強制設為 WEBM_OPUS
             config = speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS, # 若檔案格式不同需調整，或使用 ENCODING_UNSPECIFIED
-                sample_rate_hertz=48000,
+                # 設定為 UNSPECIFIED 讓 Google 自動嘗試偵測格式
+                encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED, 
+                sample_rate_hertz=48000, # 大多數瀏覽器錄音為 44100 或 48000，Google 通常能適應
                 language_code="zh-TW",
                 enable_word_time_offsets=True,
                 enable_automatic_punctuation=True,
@@ -135,23 +166,12 @@ if uploaded_file is not None:
             operation = speech_client.recognize(config=config, audio=audio)
             
             if not operation.results:
-                st.error("無法識別語音，請確認音訊清晰度。")
+                st.error("無法識別語音，可能是麥克風收音太小聲或格式不支援。")
                 st.stop()
 
+            # ... (以下的程式碼邏輯保持不變，直接複製原本的即可) ...
             result = operation.results[0].alternatives[0]
             transcript = result.transcript
-            
-            # 整理 ASR 數據
-            asr_words_data = []
-            for word_info in result.words:
-                asr_words_data.append({
-                    "word": word_info.word.strip(),
-                    "start_time": word_info.start_time,
-                    "end_time": word_info.end_time
-                })
-            
-            st.info(f"識別文本: {transcript}")
-            progress_bar.progress(30)
 
             # Step 2: LLM 判斷
             status_text.text("AI 正在審查情緒詞彙...")
