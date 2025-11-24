@@ -1,6 +1,4 @@
-fastapi
-python-multipart
-uvicorn
+streamlit>=1.40.0
 google-cloud-speech
 google-genai
 openai
