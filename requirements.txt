@@ -5,4 +5,3 @@ openai
 requests
 python-dotenv
 pydub
-pyaudioop
