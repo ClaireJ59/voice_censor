@@ -115,8 +115,7 @@ if audio_input is not None:
             
             # 針對瀏覽器錄音 (WAV) 優化的設定
             config = speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED, # 自動偵測 WAV/WebM
-                sample_rate_hertz=48000, 
+                encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED, # 自動偵測 WAV/WebM 
                 language_code="zh-TW",
                 enable_word_time_offsets=True,
                 enable_automatic_punctuation=True,
