@@ -1,0 +1,8 @@
+fastapi
+python-multipart
+uvicorn
+google-cloud-speech
+google-genai
+openai
+requests
+python-dotenv
