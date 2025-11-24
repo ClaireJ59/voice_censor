@@ -278,12 +278,4 @@ if audio_input is not None:
             st.error(f"發生錯誤: {str(e)}")
             import traceback
             st.code(traceback.format_exc())
-```
 
-### 主要改進說明
-
-1.  **保留靜音 (Censor Logic)**：
-    在您的 Flask 代碼中，您使用了 `final_audio = base_audio` 然後直接 `overlay`。這會導致原來的髒話（例如 "討厭"）和新的詞（例如 "花朵"）**同時播放**，變成混在一起的聲音。
-    這在 Censor 應用中通常是不希望的。因此我在代碼中加入了一行：
-    ```python
-    final_audio = final_audio[:start] + silence + final_audio[end:]
