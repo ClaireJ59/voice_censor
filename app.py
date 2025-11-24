@@ -2,8 +2,8 @@ import streamlit as st
 import os
 import json
 import io
-import requests
 import tempfile
+from pydub import AudioSegment
 from google.cloud import speech
 from google.oauth2 import service_account
 from google import genai
@@ -15,7 +15,7 @@ st.set_page_config(page_title="AI 語音淨化器", page_icon="✨")
 st.title("✨ AI 語音情緒淨化器")
 st.markdown("請點擊下方麥克風錄製一段語音，AI 將自動把負面詞彙變成美好的詞語。")
 
-# --- API 設定與 Client 初始化 (保持不變) ---
+# --- API 設定與 Client 初始化 ---
 def get_secret(key):
     if key in st.secrets:
         return st.secrets[key]
@@ -47,9 +47,7 @@ except Exception as e:
     st.error(f"系統初始化失敗: {e}")
     st.stop()
 
-EXTERNAL_MIX_URL = "https://a67e4a6a0969.ngrok-free.app/mix"
-
-# --- 輔助函數：滑動視窗匹配 (保持不變) ---
+# --- 輔助函數：滑動視窗匹配 ---
 def perform_sliding_window_match(asr_words: list, replacement_map: dict) -> list:
     final_logs = []
     i = 0
@@ -77,8 +75,8 @@ def perform_sliding_window_match(asr_words: list, replacement_map: dict) -> list
                 final_logs.append({
                     "original_word": candidate_phrase,
                     "replacement": replacement_word,
-                    "start_time": f"{start_seconds}s",
-                    "end_time": f"{end_seconds}s",
+                    "start_time": start_seconds, # 保持 float 方便後續計算
+                    "end_time": end_seconds,
                     "duration_seconds": duration,
                     "speed_prompt": speed_instruction
                 })
@@ -89,15 +87,10 @@ def perform_sliding_window_match(asr_words: list, replacement_map: dict) -> list
             i += 1
     return final_logs
 
-# ==========================================
-#  🔥 核心介面修改：只保留錄音功能
-# ==========================================
-
-# 直接顯示錄音元件
+# --- 核心介面：錄音功能 ---
 audio_input = st.audio_input("點擊麥克風開始錄音")
 
 if audio_input is not None:
-    # 這裡顯示處理按鈕
     if st.button("🚀 開始淨化轉換", type="primary"):
         status_text = st.empty()
         progress_bar = st.progress(0)
@@ -107,15 +100,15 @@ if audio_input is not None:
             status_text.text("正在聆聽並識別語音 (ASR)...")
             progress_bar.progress(10)
             
-            # 重要：將指標移回開頭並讀取
             audio_input.seek(0)
-            audio_content = audio_input.read()
+            audio_bytes = audio_input.read() # 讀取原始 bytes 供 ASR 和 pydub 使用
             
-            audio = speech.RecognitionAudio(content=audio_content)
+            audio = speech.RecognitionAudio(content=audio_bytes)
             
-            # 針對瀏覽器錄音 (WAV) 優化的設定
+            # 設定為 UNSPECIFIED 讓 Google 自動偵測 WAV 格式
             config = speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED, # 自動偵測 WAV/WebM 
+                encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED, 
+                sample_rate_hertz=0, # 設為 0 或刪除該行，讓其自動偵測
                 language_code="zh-TW",
                 enable_word_time_offsets=True,
                 enable_automatic_punctuation=True,
@@ -130,7 +123,6 @@ if audio_input is not None:
             result = operation.results[0].alternatives[0]
             transcript = result.transcript
             
-            # 整理 ASR 數據
             asr_words_data = []
             for word_info in result.words:
                 asr_words_data.append({
@@ -142,7 +134,7 @@ if audio_input is not None:
             st.info(f"識別到的內容: {transcript}")
             progress_bar.progress(30)
 
-            # Step 2: LLM 判斷 (Gemini)
+            # Step 2: LLM 判斷
             status_text.text("AI 正在思考如何讓這句話更美好...")
             
             schema = {
@@ -187,69 +179,76 @@ if audio_input is not None:
             with st.expander("查看 AI 替換邏輯細節"):
                 st.write(timeline_rules)
 
-            # Step 4: TTS 生成 (OpenAI)
-            status_text.text("正在生成甜美的聲音 (TTS)...")
-            tts_files = {}
-            for idx, rule in enumerate(timeline_rules):
+            # Step 4: TTS 生成 & 內部混音
+            status_text.text("正在生成甜美的聲音並進行混音...")
+            
+            # 使用 pydub 載入原始音訊
+            # 注意: st.audio_input 產生的通常是 wav
+            try:
+                original_audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
+            except Exception as e:
+                # 如果無法識別，嘗試強制指定 wav
+                original_audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="wav")
+
+            for rule in timeline_rules:
+                # 4-1. 生成 TTS
                 speed = 1.0
                 if rule['speed_prompt'] == 'fast': speed = 1.2
                 elif rule['speed_prompt'] == 'slow': speed = 0.8
                 
-                resp = openai_client.audio.speech.create(
+                tts_resp = openai_client.audio.speech.create(
                     model="tts-1", voice="nova", input=rule['replacement'], speed=speed
                 )
-                tts_files[f"replacement_{idx}"] = (f"rep_{idx}.mp3", io.BytesIO(resp.content), "audio/mpeg")
-            
-            # 填補空缺 (Padding)
-            for i in range(5):
-                key = f"replacement_{i}"
-                if key not in tts_files:
-                    tts_files[key] = ('dummy.bin', io.BytesIO(b'dummy'), 'application/octet-stream')
-            
-            progress_bar.progress(70)
+                
+                # 將 TTS mp3 轉為 AudioSegment
+                tts_audio = AudioSegment.from_file(io.BytesIO(tts_resp.content), format="mp3")
+                
+                # 4-2. 計算時間點 (秒轉毫秒)
+                start_ms = int(rule['start_time'] * 1000)
+                end_ms = int(rule['end_time'] * 1000)
+                
+                # 4-3. 混音邏輯: 
+                # (A) 將原始音訊中「負面詞」的片段靜音
+                # (B) 在該位置疊加新的 TTS 音訊
+                
+                # 為了避免長度改變導致後面的聲音對不上，我們採用「靜音+疊加」的方式
+                # 這樣總時長不變
+                
+                # 製作一段靜音，長度等於原本的負面詞長度
+                silence_duration = end_ms - start_ms
+                if silence_duration < 0: silence_duration = 0
+                silence_segment = AudioSegment.silent(duration=silence_duration)
+                
+                # 替換原始區段為靜音 (保持長度不變)
+                original_audio = original_audio[:start_ms] + silence_segment + original_audio[end_ms:]
+                
+                # 疊加 TTS (position 設定在開始時間)
+                # 注意：如果 TTS 比原詞長，會蓋到後面的字；如果比較短，會有留白。這是正常的。
+                original_audio = original_audio.overlay(tts_audio, position=start_ms)
 
-            # Step 5: 混音請求
-            status_text.text("正在進行最終魔法合成...")
-            audio_input.seek(0)
-            
-            censor_rules_json = json.dumps([{
-                "replacement": r['replacement'],
-                "start_time": r['start_time'],
-                "end_time": r['end_time']
-            } for r in timeline_rules])
+            progress_bar.progress(90)
+            status_text.text("處理完成，正在輸出...")
 
-            # 注意：st.audio_input 的 name 屬性可能不固定，我們手動給一個
-            original_filename = "recording.wav" 
+            # 匯出最終檔案
+            buffer = io.BytesIO()
+            original_audio.export(buffer, format="mp3")
+            final_audio_bytes = buffer.getvalue()
+
+            progress_bar.progress(100)
+            status_text.text("✨ 完成！")
+            st.balloons()
             
-            files_to_upload = {
-                'original_audio': (original_filename, audio_input, "audio/wav"),
-                **tts_files
-            }
+            st.subheader("🎧 您的淨化版語音")
+            st.audio(final_audio_bytes, format='audio/mpeg')
             
-            mix_response = requests.post(
-                EXTERNAL_MIX_URL,
-                data={'censor_rules': censor_rules_json},
-                files=files_to_upload
+            st.download_button(
+                label="下載 MP3",
+                data=final_audio_bytes,
+                file_name="censored_recording.mp3",
+                mime="audio/mpeg"
             )
 
-            if mix_response.status_code == 200:
-                progress_bar.progress(100)
-                status_text.text("✨ 完成！")
-                st.balloons() # 放個慶祝特效
-                
-                st.subheader("🎧 您的淨化版語音")
-                st.audio(mix_response.content, format='audio/mpeg')
-                
-                st.download_button(
-                    label="下載 MP3",
-                    data=mix_response.content,
-                    file_name="censored_recording.mp3",
-                    mime="audio/mpeg"
-                )
-            else:
-                st.error(f"混音服務發生錯誤: {mix_response.text}")
-
         except Exception as e:
-            st.error(f"發生預期外的錯誤: {str(e)}")
+            st.error(f"發生錯誤: {str(e)}")
             import traceback
             st.code(traceback.format_exc())
