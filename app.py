@@ -109,7 +109,6 @@ if audio_input is not None:
         progress_bar = st.progress(0)
 
         try:
-            try:
             # Step 1: 讀取與轉檔 (解決 iOS 問題的關鍵!)
             status_text.text("正在處理音訊格式 (兼容 iOS)...")
             progress_bar.progress(5)
