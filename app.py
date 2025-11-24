@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import json
 import io
+import shutil
 import math
 from pydub import AudioSegment
 from google.cloud import speech
@@ -10,18 +11,29 @@ from google import genai
 from google.genai import types
 from openai import OpenAI
 
+# --- 強制設定 FFmpeg 路徑 (解決 iOS 轉檔崩潰問題) ---
+# Streamlit Cloud (Debian) 的 ffmpeg 通常在 /usr/bin/ffmpeg
+ffmpeg_path = shutil.which("ffmpeg")
+if ffmpeg_path:
+    AudioSegment.converter = ffmpeg_path
+    AudioSegment.ffmpeg = ffmpeg_path
+    AudioSegment.ffprobe = shutil.which("ffprobe")
+else:
+    # 備用路徑
+    AudioSegment.converter = "/usr/bin/ffmpeg" 
+
 # --- 頁面設定 ---
-st.set_page_config(page_title="AI 語音淨化器 (iOS兼容版)", page_icon="🎛️")
-st.title("🎛️ AI 語音淨化器 - 全平台兼容版")
-st.markdown("自動偵測負面詞彙，並將美好詞彙**疊加**在原音上（保留原音）。")
+st.set_page_config(page_title="AI 語音淨化器 (iOS 穩定版)", page_icon="🎤")
+st.title("🎤 AI 語音淨化器")
+st.markdown("支援 iOS/Android/PC，自動將負面詞彙轉換為美好意象。")
 
 # --- 側邊欄設定 ---
 with st.sidebar:
-    st.header("🎛️ 混音微調")
-    manual_delay_ms = st.slider("手動延遲 (ms)", min_value=-500, max_value=500, value=0, step=10, help="正數代表延後播放，負數代表提早播放")
-    volume_boost = st.slider("替換音量增益 (dB)", min_value=0, max_value=30, value=20, help="讓替換的聲音比原音大聲一點")
+    st.header("🎛️ 混音設定")
+    manual_delay_ms = st.slider("手動延遲修正 (ms)", -500, 500, 0, 10)
+    volume_boost = st.slider("替換音量 (dB)", 0, 30, 15)
 
-# --- API 設定與 Client 初始化 ---
+# --- API 初始化 ---
 def get_secret(key):
     if key in st.secrets:
         return st.secrets[key]
@@ -30,7 +42,6 @@ def get_secret(key):
     return None
 
 try:
-    # Google Cloud 憑證
     if "google_cloud" in st.secrets:
         creds_dict = dict(st.secrets["google_cloud"])
         creds = service_account.Credentials.from_service_account_info(creds_dict)
@@ -38,236 +49,181 @@ try:
     else:
         speech_client = speech.SpeechClient()
 
-    # API Keys
     google_api_key = get_secret("GOOGLE_API_KEY")
     openai_api_key = get_secret("OPENAI_API_KEY")
     
     if not google_api_key or not openai_api_key:
-        st.error("找不到 API 金鑰，請檢查 Secrets 設定。")
+        st.error("金鑰缺失，請檢查 Secrets。")
         st.stop()
 
     gemini_client = genai.Client(api_key=google_api_key)
     openai_client = OpenAI(api_key=openai_api_key)
 
 except Exception as e:
-    st.error(f"系統初始化失敗: {e}")
+    st.error(f"初始化錯誤: {e}")
     st.stop()
 
-# --- 核心邏輯: 變速處理 ---
+# --- Helper Functions ---
 def speed_change(sound, speed=1.0):
     sound_with_altered_frame_rate = sound._spawn(sound.raw_data, overrides={
         "frame_rate": int(sound.frame_rate * speed)
     })
     return sound_with_altered_frame_rate.set_frame_rate(sound.frame_rate)
 
-# --- 核心邏輯: 滑動視窗匹配 ---
 def perform_sliding_window_match(asr_words: list, replacement_map: dict) -> list:
     final_logs = []
     i = 0
     n = len(asr_words)
     MAX_WINDOW_SIZE = 5
-
     while i < n:
         matched = False
         for window_size in range(min(MAX_WINDOW_SIZE, n - i), 0, -1):
             words_slice = asr_words[i : i + window_size]
             candidate_phrase = "".join([w['word'] for w in words_slice])
-            
             if candidate_phrase in replacement_map:
                 replacement_word = replacement_map[candidate_phrase]
                 start_seconds = words_slice[0]['start_time'].total_seconds()
                 end_seconds = words_slice[-1]['end_time'].total_seconds()
-                
-                duration = end_seconds - start_seconds
-                speed_instruction = "normal" 
-
                 final_logs.append({
                     "original_word": candidate_phrase,
                     "replacement": replacement_word,
                     "start_time": start_seconds,
                     "end_time": end_seconds,
-                    "duration_seconds": duration,
-                    "speed_prompt": speed_instruction
+                    "duration_seconds": end_seconds - start_seconds,
+                    "speed_prompt": "normal"
                 })
                 i += window_size
                 matched = True
                 break
-        if not matched:
-            i += 1
+        if not matched: i += 1
     return final_logs
 
-# --- 主介面邏輯 ---
-audio_input = st.audio_input("點擊麥克風開始錄音")
+# --- 主介面與邏輯 ---
+audio_input = st.audio_input("請按麥克風錄音 (iOS 請稍等幾秒上傳)")
 
 if audio_input is not None:
-    if st.button("🚀 開始淨化轉換", type="primary"):
-        status_text = st.empty()
-        progress_bar = st.progress(0)
-
+    # 1. 先顯示錄音檔案資訊，確認 App 沒有崩潰
+    audio_input.seek(0, os.SEEK_END)
+    file_size = audio_input.tell()
+    audio_input.seek(0)
+    
+    st.info(f"✅ 錄音成功！檔案大小: {file_size / 1024:.1f} KB")
+    
+    if st.button("🚀 開始淨化", type="primary"):
+        status = st.status("正在處理中...", expanded=True)
+        
         try:
-            # Step 1: 讀取與轉檔 (解決 iOS 問題的關鍵!)
-            status_text.text("正在處理音訊格式 (兼容 iOS)...")
-            progress_bar.progress(5)
+            # --- Step 1: 格式轉換 (最容易出錯的地方) ---
+            status.write("🔄 正在轉換音訊格式 (WAV)...")
+            raw_bytes = audio_input.read()
             
-            audio_input.seek(0)
-            raw_audio_bytes = audio_input.read()
-            
-            # 1-1. 使用 pydub 將任何格式 (m4a, mp4, webm) 強制轉為 WAV
-            # 這是因為 Google ASR 不支援 iOS 預設的 m4a 格式
             try:
-                # from_file 會自動偵測輸入格式 (需依賴 ffmpeg)
-                input_audio = AudioSegment.from_file(io.BytesIO(raw_audio_bytes))
+                # 嘗試讀取 (自動偵測格式，包含 m4a)
+                input_audio = AudioSegment.from_file(io.BytesIO(raw_bytes))
                 
-                # 轉為單聲道 (Mono) + 16kHz (Google ASR 推薦格式)
+                # 強制轉為 Google 喜歡的格式 (Mono, 16kHz) 減輕負載
                 input_audio = input_audio.set_channels(1).set_frame_rate(16000)
                 
-                # 匯出成 bytes
                 wav_buffer = io.BytesIO()
                 input_audio.export(wav_buffer, format="wav")
                 clean_wav_bytes = wav_buffer.getvalue()
                 
-            except Exception as e:
-                st.error(f"音訊格式轉換失敗，請確認是否已安裝 ffmpeg。錯誤: {e}")
+            except Exception as ffmpeg_err:
+                status.update(label="格式轉換失敗", state="error")
+                st.error(f"無法讀取錄音檔，可能是 FFmpeg 未安裝或格式不支援。\n詳細錯誤: {ffmpeg_err}")
                 st.stop()
 
-            # Step 2: ASR 識別 (使用乾淨的 WAV)
-            status_text.text("正在識別語音內容 (Google ASR)...")
-            progress_bar.progress(10)
-            
+            # --- Step 2: ASR ---
+            status.write("👂 正在識別語音 (ASR)...")
             audio = speech.RecognitionAudio(content=clean_wav_bytes)
-            
-            # 因為我們已經強制轉成 16kHz WAV，這裡可以直接指定 config，不用自動偵測了
             config = speech.RecognitionConfig(
                 encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                sample_rate_hertz=16000, 
+                sample_rate_hertz=16000,
                 language_code="zh-TW",
                 enable_word_time_offsets=True,
                 enable_automatic_punctuation=True,
             )
-
             operation = speech_client.recognize(config=config, audio=audio)
             
             if not operation.results:
-                st.warning("沒有偵測到清晰的語音，請再試一次。")
+                status.update(label="識別失敗", state="error")
+                st.warning("沒有聽清楚您說的話，請再試一次。")
                 st.stop()
 
-            result = operation.results[0].alternatives[0]
-            transcript = result.transcript
-            
+            transcript = operation.results[0].alternatives[0].transcript
             asr_words_data = []
-            for word_info in result.words:
+            for w in operation.results[0].alternatives[0].words:
                 asr_words_data.append({
-                    "word": word_info.word.strip(),
-                    "start_time": word_info.start_time,
-                    "end_time": word_info.end_time
+                    "word": w.word.strip(),
+                    "start_time": w.start_time,
+                    "end_time": w.end_time
                 })
             
-            st.info(f"識別內容: {transcript}")
-            progress_bar.progress(30)
+            status.write(f"📝 識別內容: {transcript}")
 
-            # Step 3: LLM 判斷
-            status_text.text("AI 正在審查情緒詞彙...")
-            
-            schema = {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "original_word": {"type": "string"},
-                        "replacement_word": {"type": "string"}
-                    },
-                    "required": ["original_word", "replacement_word"]
-                }
-            }
-            
+            # --- Step 3: LLM ---
+            status.write("🤖 AI 正在審查與替換...")
             prompt = f"""
             你是一位專業的情緒詞彙審查與轉換引擎。
             任務：找出負面情緒詞彙並替換為正向、意象美好的詞彙 (如：彩虹、花朵、泡泡、棉花糖)。
             輸入文本: "{transcript}"
             """
+            # 簡化 Schema
+            schema = {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"original_word": {"type": "string"}, "replacement_word": {"type": "string"}},
+                    "required": ["original_word", "replacement_word"]
+                }
+            }
             
-            llm_response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=schema,
-                )
+            llm_res = gemini_client.models.generate_content(
+                model='gemini-2.5-flash', contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema)
             )
-            censor_list = json.loads(llm_response.text)
-            replacement_map = { item['original_word'].strip(): item['replacement_word'] for item in censor_list }
+            censor_list = json.loads(llm_res.text)
+            replacement_map = { i['original_word'].strip(): i['replacement_word'] for i in censor_list }
             
             if not replacement_map:
-                st.success("沒有發現負面詞彙！")
-                progress_bar.progress(100)
+                status.update(label="完成", state="complete")
+                st.success("這句話很棒，沒有負面詞彙！")
                 st.stop()
-                
-            progress_bar.progress(50)
 
-            # Step 4: 匹配與混音
-            timeline_rules = perform_sliding_window_match(asr_words_data, replacement_map)
-            
-            with st.expander("查看詳細替換邏輯"):
-                st.write(timeline_rules)
+            # --- Step 4: 混音 ---
+            status.write("🎹 正在合成與混音...")
+            timeline = perform_sliding_window_match(asr_words_data, replacement_map)
+            final_audio = input_audio # 使用轉檔後的乾淨音訊當基底
 
-            status_text.text("正在生成語音並進行雙重混音...")
-            
-            # 使用剛剛轉好的 input_audio 作為基底 (這樣就不會再有格式讀取錯誤)
-            final_audio = input_audio
-
-            for rule in timeline_rules:
-                # TTS 生成
+            for rule in timeline:
                 tts_resp = openai_client.audio.speech.create(
                     model="tts-1", voice="nova", input=rule['replacement']
                 )
-                replace_audio = AudioSegment.from_file(io.BytesIO(tts_resp.content), format="mp3")
+                rep_audio = AudioSegment.from_file(io.BytesIO(tts_resp.content), format="mp3")
                 
-                # 時間計算
-                original_start_ms = int(rule['start_time'] * 1000)
-                original_end_ms = int(rule['end_time'] * 1000)
-                original_duration_ms = original_end_ms - original_start_ms
+                # 時間與變速
+                orig_dur = rule['duration_seconds']
+                cur_len = len(rep_audio) / 1000.0
+                speed = cur_len / orig_dur if orig_dur > 0 else 1.0
+                speed = max(0.8, min(speed, 1.2))
                 
-                # 變速處理
-                current_len = len(replace_audio)
-                if original_duration_ms > 0:
-                    calculated_speed = current_len / original_duration_ms
-                else:
-                    calculated_speed = 1.0
-                speed_factor = max(0.8, min(calculated_speed, 1.2))
-                adjusted_audio = speed_change(replace_audio, speed=speed_factor)
+                adj_audio = speed_change(rep_audio, speed) + volume_boost
                 
-                # 音量增強
-                adjusted_audio = adjusted_audio + volume_boost
+                # 置中計算
+                orig_center_ms = (rule['start_time'] + rule['end_time']) * 1000 / 2
+                pos_ms = int(orig_center_ms)
                 
-                # 置中對齊
-                original_center = (original_start_ms + original_end_ms) / 2
-                half_new_duration = len(adjusted_audio) / 2
-                final_position_ms = int(original_center)
-                final_position_ms = max(0, final_position_ms)
-                
-                # 疊加
-                final_audio = final_audio.overlay(adjusted_audio, position=final_position_ms)
+                final_audio = final_audio.overlay(adj_audio, position=max(0, pos_ms))
 
-            progress_bar.progress(100)
-            status_text.text("✨ 處理完成！")
-            st.balloons()
+            # --- 輸出 ---
+            status.update(label="處理完成！", state="complete")
+            out_buffer = io.BytesIO()
+            final_audio.export(out_buffer, format="mp3")
             
-            # 輸出結果
-            buffer = io.BytesIO()
-            final_audio.export(buffer, format="mp3")
-            final_audio_bytes = buffer.getvalue()
-            
-            st.subheader("🎧 淨化後的聲音 (保留原音)")
-            st.audio(final_audio_bytes, format='audio/mpeg')
-            
-            st.download_button(
-                label="下載 MP3",
-                data=final_audio_bytes,
-                file_name="censored_remix_ios.mp3",
-                mime="audio/mpeg"
-            )
+            st.subheader("🎧 您的淨化版語音")
+            st.audio(out_buffer.getvalue(), format='audio/mpeg')
+            st.download_button("下載 MP3", out_buffer.getvalue(), "remix.mp3", "audio/mpeg")
 
         except Exception as e:
-            st.error(f"發生錯誤: {str(e)}")
-            import traceback
-            st.code(traceback.format_exc())
+            status.update(label="發生錯誤", state="error")
+            st.error(f"執行失敗: {str(e)}")
