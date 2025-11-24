@@ -1,46 +1,74 @@
+import streamlit as st
 import os
 import json
-import base64
 import io
-import asyncio
 import requests
-from typing import List, Dict
-
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import Response
-
-# 載入環境變數
-from dotenv import load_dotenv
-load_dotenv()
-
-# --- SDK Imports ---
+import tempfile
 from google.cloud import speech
+from google.oauth2 import service_account
 from google import genai
 from google.genai import types
 from openai import OpenAI
 
-app = FastAPI()
+# --- 頁面設定 ---
+st.set_page_config(page_title="AI 語音淨化器", page_icon="✨")
+st.title("✨ AI 語音情緒淨化器")
+st.markdown("上傳一段語音，AI 將自動識別負面詞彙並替換為美好的詞語。")
 
-# --- 初始化 Clients ---
-# 1. Google ASR Client (建議設定 GOOGLE_APPLICATION_CREDENTIALS 環境變數指向 JSON 金鑰檔)
-speech_client = speech.SpeechClient()
+# --- 側邊欄：API 設定 (本地測試用 .env，雲端用 st.secrets) ---
+# 為了方便部署，我們優先檢查 st.secrets，如果沒有則嘗試環境變數
+# 定義一個讀取金鑰的函數，優先查 Secrets，沒有才查系統變數
+def get_secret(key):
+    if key in st.secrets:
+        return st.secrets[key]
+    if os.getenv(key):
+        return os.getenv(key)
+    return None # 或是拋出錯誤
 
-# 2. Google Gemini Client
-gemini_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+# 獲取金鑰
+google_api_key = get_secret("GOOGLE_API_KEY")
+openai_api_key = get_secret("OPENAI_API_KEY")
 
-# 3. OpenAI Client
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# 檢查是否成功獲取 (這一步很重要，可以避免報出難懂的錯誤)
+if not google_api_key:
+    st.error("找不到 GOOGLE_API_KEY，請檢查 Secrets 設定。")
+    st.stop()
 
-# --- 設定 ---
-EXTERNAL_MIX_URL = "https://a67e4a6a0969.ngrok-free.app/mix"  # 您的外部混音服務 URL
+if not openai_api_key:
+    st.error("找不到 OPENAI_API_KEY，請檢查 Secrets 設定。")
+    st.stop()
 
-# ==========================================
-#  Helper Function: 滑動視窗匹配 (對應 n8n 節點 05)
-# ==========================================
+# 初始化 Client
+gemini_client = genai.Client(api_key=google_api_key)
+openai_client = OpenAI(api_key=openai_api_key)
+
+# --- 核心邏輯函數 (快取以提升效能) ---
+# 1. 初始化 Google ASR Client
+@st.cache_resource
+def get_speech_client():
+    # 嘗試從 secrets 讀取 Google Cloud JSON 內容
+    if "google_cloud" in st.secrets:
+        # 將 secrets 轉換為 dict
+        creds_dict = dict(st.secrets["google_cloud"])
+        creds = service_account.Credentials.from_service_account_info(creds_dict)
+        return speech.SpeechClient(credentials=creds)
+    else:
+        # 本地開發如果設定了環境變數路徑
+        return speech.SpeechClient()
+
+# 2. 初始化其他 Clients
+try:
+    speech_client = get_speech_client()
+    gemini_client = genai.Client(api_key=get_secret("GOOGLE_API_KEY"))
+    openai_client = OpenAI(api_key=get_secret("OPENAI_API_KEY"))
+except Exception as e:
+    st.error(f"API 初始化失敗，請檢查 Secrets 設定: {e}")
+    st.stop()
+
+EXTERNAL_MIX_URL = "https://a67e4a6a0969.ngrok-free.app/mix"
+
+# --- 輔助函數：滑動視窗匹配 ---
 def perform_sliding_window_match(asr_words: list, replacement_map: dict) -> list:
-    """
-    將 ASR 的時間戳記與 LLM 的替換詞進行匹配
-    """
     final_logs = []
     i = 0
     n = len(asr_words)
@@ -48,31 +76,21 @@ def perform_sliding_window_match(asr_words: list, replacement_map: dict) -> list
 
     while i < n:
         matched = False
-        # 從最長視窗開始嘗試匹配 (例如: "誤人子弟" -> 4個字)
         for window_size in range(min(MAX_WINDOW_SIZE, n - i), 0, -1):
             words_slice = asr_words[i : i + window_size]
-            
-            # 組合候選詞 (去除空白)
             candidate_phrase = "".join([w['word'] for w in words_slice])
             
             if candidate_phrase in replacement_map:
                 replacement_word = replacement_map[candidate_phrase]
-                
-                # 提取時間
-                start_time_obj = words_slice[0]['start_time'] # timedelta
-                end_time_obj = words_slice[-1]['end_time']   # timedelta
-                
-                start_seconds = start_time_obj.total_seconds()
-                end_seconds = end_time_obj.total_seconds()
+                start_seconds = words_slice[0]['start_time'].total_seconds()
+                end_seconds = words_slice[-1]['end_time'].total_seconds()
                 
                 duration = end_seconds - start_seconds + 1.5
                 if duration <= 0: duration = 0.5
                 
-                # 簡單的語速提示邏輯
-                speed_instruction = "Speak normally."
-                if duration < 0.4: speed_instruction = "Speak extremely fast."
-                elif duration < 0.8: speed_instruction = "Speak quickly."
-                elif duration > 1.5: speed_instruction = "Speak very slowly."
+                speed_instruction = "normal"
+                if duration < 0.4: speed_instruction = "fast"
+                elif duration > 1.5: speed_instruction = "slow"
 
                 final_logs.append({
                     "original_word": candidate_phrase,
@@ -82,192 +100,158 @@ def perform_sliding_window_match(asr_words: list, replacement_map: dict) -> list
                     "duration_seconds": duration,
                     "speed_prompt": speed_instruction
                 })
-                
                 i += window_size
                 matched = True
                 break
-        
         if not matched:
             i += 1
-            
     return final_logs
 
-# ==========================================
-#  Main Endpoint: 處理音訊 (對應 n8n 完整流程)
-# ==========================================
-@app.post("/process-audio")
-async def process_audio(file: UploadFile = File(...)):
-    """
-    接收音訊 -> ASR -> LLM Censor -> TTS -> External Mix -> Return Audio
-    """
-    try:
-        print(f"1. 接收檔案: {file.filename}")
-        audio_content = await file.read()
+# --- 主介面 ---
+uploaded_file = st.file_uploader("請選擇音訊檔案 (WAV, MP3, WEBM)", type=["wav", "mp3", "webm", "m4a"])
 
-        # ---------------------------------------------------------
-        # Step 1: Google ASR (對應節點: 02_ASR_語音轉文字)
-        # ---------------------------------------------------------
-        audio = speech.RecognitionAudio(content=audio_content)
-        config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS, # 或根據輸入動態調整
-            sample_rate_hertz=48000, # 根據實際情況調整，或設為 0 (自動)
-            language_code="zh-TW",
-            enable_word_time_offsets=True,
-            enable_automatic_punctuation=True,
-        )
+if uploaded_file is not None:
+    st.audio(uploaded_file, format='audio/audio', start_time=0)
+    
+    if st.button("🚀 開始轉換", type="primary"):
+        status_text = st.empty()
+        progress_bar = st.progress(0)
 
-        operation = speech_client.recognize(config=config, audio=audio)
-        
-        if not operation.results:
-            return {"error": "No speech detected"}
+        try:
+            # Step 1: 讀取檔案與 ASR
+            status_text.text("正在進行語音識別 (ASR)...")
+            progress_bar.progress(10)
+            
+            audio_content = uploaded_file.read()
+            audio = speech.RecognitionAudio(content=audio_content)
+            config = speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS, # 若檔案格式不同需調整，或使用 ENCODING_UNSPECIFIED
+                sample_rate_hertz=48000,
+                language_code="zh-TW",
+                enable_word_time_offsets=True,
+                enable_automatic_punctuation=True,
+            )
 
-        result = operation.results[0].alternatives[0]
-        transcript = result.transcript
-        
-        # 整理 ASR 單詞數據 (保留 timedelta 物件以便計算)
-        asr_words_data = []
-        for word_info in result.words:
-            asr_words_data.append({
-                "word": word_info.word.strip(),
-                "start_time": word_info.start_time,
-                "end_time": word_info.end_time
-            })
+            operation = speech_client.recognize(config=config, audio=audio)
+            
+            if not operation.results:
+                st.error("無法識別語音，請確認音訊清晰度。")
+                st.stop()
 
-        print(f"2. ASR 完成: {transcript[:20]}...")
+            result = operation.results[0].alternatives[0]
+            transcript = result.transcript
+            
+            # 整理 ASR 數據
+            asr_words_data = []
+            for word_info in result.words:
+                asr_words_data.append({
+                    "word": word_info.word.strip(),
+                    "start_time": word_info.start_time,
+                    "end_time": word_info.end_time
+                })
+            
+            st.info(f"識別文本: {transcript}")
+            progress_bar.progress(30)
 
-        # ---------------------------------------------------------
-        # Step 2: Gemini LLM Censor (對應節點: 04_LLM_Censor判斷)
-        # ---------------------------------------------------------
-        # 定義輸出的 JSON Schema
-        schema = {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "original_word": {"type": "string"},
-                    "replacement_word": {"type": "string"}
-                },
-                "required": ["original_word", "replacement_word"]
+            # Step 2: LLM 判斷
+            status_text.text("AI 正在審查情緒詞彙...")
+            
+            schema = {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "original_word": {"type": "string"},
+                        "replacement_word": {"type": "string"}
+                    },
+                    "required": ["original_word", "replacement_word"]
+                }
             }
-        }
-
-        prompt = f"""
-        你是一位專業的情緒詞彙審查與轉換引擎。
-        你的任務是：找出負面情緒詞彙並替換為正向、意象美好的詞彙 (如：彩虹、花朵、泡泡)。
-        輸入文本: "{transcript}"
-        """
-
-        llm_response = gemini_client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=schema,
-            )
-        )
-        
-        censor_list = json.loads(llm_response.text)
-        
-        # 建立替換地圖 (Map)
-        replacement_map = { 
-            item['original_word'].strip(): item['replacement_word'] 
-            for item in censor_list 
-        }
-
-        print(f"3. LLM 替換規則: {len(replacement_map)} 個")
-
-        # ---------------------------------------------------------
-        # Step 3: 滑動視窗匹配 (對應節點: 05_規則計算)
-        # ---------------------------------------------------------
-        timeline_rules = perform_sliding_window_match(asr_words_data, replacement_map)
-        
-        if not timeline_rules:
-            print("無須替換，直接返回原始音訊或是錯誤")
-            # 這裡您可以決定是直接回傳原始檔，還是繼續流程但無替換
-            # 為了簡化，我們假設繼續流程
-
-        # ---------------------------------------------------------
-        # Step 4: OpenAI TTS 生成 (對應節點: 07_TTS_生成替換音訊)
-        # ---------------------------------------------------------
-        # 這裡我們使用並發 (Async) 或是簡單的迴圈來生成音訊
-        tts_files = {} # 用來存儲 replacement_0, replacement_1...
-
-        for idx, rule in enumerate(timeline_rules):
-            tts_prompt = rule['replacement']
-            # n8n 節點中還有根據 duration 控制語速的 prompt，這裡簡化處理
-            # 若要精確控制語速，OpenAI TTS 只能透過 API 的 'speed' 參數 (0.25 - 4.0)
             
-            # 簡單計算 OpenAI speed 參數
-            base_speed = 1.0
-            if "fast" in rule['speed_prompt']: base_speed = 1.2
-            elif "slow" in rule['speed_prompt']: base_speed = 0.8
-
-            response = openai_client.audio.speech.create(
-                model="tts-1",
-                voice="nova",
-                input=tts_prompt,
-                speed=base_speed
-            )
+            prompt = f"""
+            你是一位專業的情緒詞彙審查與轉換引擎。
+            任務：找出負面情緒詞彙並替換為正向、意象美好的詞彙 (如：彩虹、花朵、泡泡)。
+            輸入文本: "{transcript}"
+            """
             
-            # 將音訊存入記憶體 (BytesIO)
-            audio_io = io.BytesIO(response.content)
-            tts_files[f"replacement_{idx}"] = (f"rep_{idx}.mp3", audio_io, "audio/mpeg")
+            llm_response = gemini_client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                )
+            )
+            censor_list = json.loads(llm_response.text)
+            replacement_map = { item['original_word'].strip(): item['replacement_word'] for item in censor_list }
+            
+            if not replacement_map:
+                st.success("沒有檢測到負面詞彙！")
+                st.stop()
+                
+            progress_bar.progress(50)
 
-        # 補滿 dummy 檔案 (對應節點: 09_資料打包2 的 Padding 邏輯)
-        # 您的外部服務似乎預期 5 個 slots
-        for i in range(5):
-            key = f"replacement_{i}"
-            if key not in tts_files:
-                tts_files[key] = ('dummy.bin', io.BytesIO(b'dummy'), 'application/octet-stream')
+            # Step 3: 匹配時間軸
+            timeline_rules = perform_sliding_window_match(asr_words_data, replacement_map)
+            st.write("替換計劃:", timeline_rules)
 
-        print(f"4. TTS 生成完成，準備混音")
+            # Step 4: TTS 生成
+            status_text.text("正在生成替換音訊 (TTS)...")
+            tts_files = {}
+            for idx, rule in enumerate(timeline_rules):
+                speed = 1.0
+                if rule['speed_prompt'] == 'fast': speed = 1.2
+                elif rule['speed_prompt'] == 'slow': speed = 0.8
+                
+                resp = openai_client.audio.speech.create(
+                    model="tts-1", voice="nova", input=rule['replacement'], speed=speed
+                )
+                tts_files[f"replacement_{idx}"] = (f"rep_{idx}.mp3", io.BytesIO(resp.content), "audio/mpeg")
+            
+            # Padding
+            for i in range(5):
+                key = f"replacement_{i}"
+                if key not in tts_files:
+                    tts_files[key] = ('dummy.bin', io.BytesIO(b'dummy'), 'application/octet-stream')
+            
+            progress_bar.progress(70)
 
-        # ---------------------------------------------------------
-        # Step 5: 呼叫外部混音服務 (對應節點: 10_外部混音服務)
-        # ---------------------------------------------------------
-        # 準備 multipart/form-data
-        
-        # 1. 規則 JSON 字串
-        censor_rules_json = json.dumps([{
-            "replacement": r['replacement'],
-            "start_time": r['start_time'],
-            "end_time": r['end_time']
-        } for r in timeline_rules])
+            # Step 5: 混音
+            status_text.text("正在進行最終混音...")
+            uploaded_file.seek(0)
+            
+            censor_rules_json = json.dumps([{
+                "replacement": r['replacement'],
+                "start_time": r['start_time'],
+                "end_time": r['end_time']
+            } for r in timeline_rules])
 
-        payload = {'censor_rules': censor_rules_json}
-        
-        # 2. 檔案部分 (原始音訊 + TTS 音訊)
-        # 重置原始音訊的指針以供讀取
-        file.file.seek(0)
-        files_to_upload = {
-            'original_audio': (file.filename, file.file, file.content_type),
-            **tts_files
-        }
+            files_to_upload = {
+                'original_audio': (uploaded_file.name, uploaded_file, uploaded_file.type),
+                **tts_files
+            }
+            
+            mix_response = requests.post(
+                EXTERNAL_MIX_URL,
+                data={'censor_rules': censor_rules_json},
+                files=files_to_upload
+            )
 
-        print("5. 發送至外部混音服務...")
-        mix_response = requests.post(
-            EXTERNAL_MIX_URL,
-            data=payload,
-            files=files_to_upload
-        )
+            if mix_response.status_code == 200:
+                progress_bar.progress(100)
+                status_text.text("完成！")
+                st.success("轉換成功！")
+                
+                # 展示與下載
+                st.audio(mix_response.content, format='audio/mpeg')
+                st.download_button(
+                    label="下載處理後的音訊",
+                    data=mix_response.content,
+                    file_name="censored_audio.mp3",
+                    mime="audio/mpeg"
+                )
+            else:
+                st.error(f"混音服務錯誤: {mix_response.text}")
 
-        if mix_response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Mixing service error: {mix_response.text}")
-
-        # ---------------------------------------------------------
-        # Step 6: 回傳最終音檔 (對應節點: 11_回傳最終音檔)
-        # ---------------------------------------------------------
-        return Response(
-            content=mix_response.content,
-            media_type="audio/mpeg", # 或根據混音服務的返回類型調整
-            headers={"Content-Disposition": "attachment; filename=final_mix.mp3"}
-        )
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        except Exception as e:
+            st.error(f"發生錯誤: {str(e)}")
