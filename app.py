@@ -11,9 +11,9 @@ from google.genai import types
 from openai import OpenAI
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="AI 語音淨化器 (進階混音版)", page_icon="🎛️")
-st.title("🎛️ AI 語音淨化器 - 進階版")
-st.markdown("自動偵測負面詞彙，並透過 **動態變速** 與 **置中對齊** 進行完美替換。")
+st.set_page_config(page_title="AI 語音淨化器 (iOS兼容版)", page_icon="🎛️")
+st.title("🎛️ AI 語音淨化器 - 全平台兼容版")
+st.markdown("自動偵測負面詞彙，並將美好詞彙**疊加**在原音上（保留原音）。")
 
 # --- 側邊欄設定 ---
 with st.sidebar:
@@ -53,10 +53,8 @@ except Exception as e:
     st.error(f"系統初始化失敗: {e}")
     st.stop()
 
-# --- 核心邏輯: 變速處理 (移植自您的代碼) ---
+# --- 核心邏輯: 變速處理 ---
 def speed_change(sound, speed=1.0):
-    # 使用 frame_rate 覆寫來改變速度 (會同時改變音高，類似黑膠唱片加速)
-    # 這是最自然的變速方式，不會產生數位雜音
     sound_with_altered_frame_rate = sound._spawn(sound.raw_data, overrides={
         "frame_rate": int(sound.frame_rate * speed)
     })
@@ -81,8 +79,6 @@ def perform_sliding_window_match(asr_words: list, replacement_map: dict) -> list
                 end_seconds = words_slice[-1]['end_time'].total_seconds()
                 
                 duration = end_seconds - start_seconds
-                
-                # 這裡只做簡單標記，詳細變速在後面混音階段處理
                 speed_instruction = "normal" 
 
                 final_logs.append({
@@ -168,7 +164,8 @@ if audio_input is not None:
             
             st.info(f"識別內容: {transcript}")
             progress_bar.progress(30)
-            # Step 2: LLM
+
+            # Step 3: LLM 判斷
             status_text.text("AI 正在審查情緒詞彙...")
             
             schema = {
@@ -190,7 +187,7 @@ if audio_input is not None:
             """
             
             llm_response = gemini_client.models.generate_content(
-                model='gemini-2.0-flash',
+                model='gemini-2.5-flash',
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -207,71 +204,48 @@ if audio_input is not None:
                 
             progress_bar.progress(50)
 
-            # Step 3: 匹配與混音
+            # Step 4: 匹配與混音
             timeline_rules = perform_sliding_window_match(asr_words_data, replacement_map)
             
             with st.expander("查看詳細替換邏輯"):
                 st.write(timeline_rules)
 
-            status_text.text("正在生成語音並進行進階混音...")
+            status_text.text("正在生成語音並進行雙重混音...")
             
-            # 載入原始音訊 (pydub)
-            try:
-                original_audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
-            except:
-                original_audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="wav")
-
-            # 為了避免多次疊加導致音量爆音或錯位，我們建立一個空的靜音軌道來放替換詞，最後再疊回去
-            # 或者直接在 original_audio 上操作（這裡採用直接操作，比較符合您的邏輯）
-            final_audio = original_audio
+            # 使用剛剛轉好的 input_audio 作為基底 (這樣就不會再有格式讀取錯誤)
+            final_audio = input_audio
 
             for rule in timeline_rules:
-                # 4-1. TTS 生成
+                # TTS 生成
                 tts_resp = openai_client.audio.speech.create(
                     model="tts-1", voice="nova", input=rule['replacement']
                 )
                 replace_audio = AudioSegment.from_file(io.BytesIO(tts_resp.content), format="mp3")
                 
-                # 4-2. 時間計算
+                # 時間計算
                 original_start_ms = int(rule['start_time'] * 1000)
                 original_end_ms = int(rule['end_time'] * 1000)
                 original_duration_ms = original_end_ms - original_start_ms
                 
-                # 4-3. 變速處理邏輯 (您的核心邏輯)
+                # 變速處理
                 current_len = len(replace_audio)
-                
-                # 計算需要的速度 (讓替換詞長度 = 原詞長度)
                 if original_duration_ms > 0:
                     calculated_speed = current_len / original_duration_ms
                 else:
                     calculated_speed = 1.0
-                
-                # 限制速度在 0.8 ~ 1.2 之間，避免聲音太奇怪
                 speed_factor = max(0.8, min(calculated_speed, 1.2))
-                
-                # 執行變速
                 adjusted_audio = speed_change(replace_audio, speed=speed_factor)
                 
-                # 4-4. 音量增強
+                # 音量增強
                 adjusted_audio = adjusted_audio + volume_boost
                 
-                
-                # 4-6. 置中對齊計算 (Centering Logic)
-                # 目標：讓 adjusted_audio 的中心點，對齊原本片段的中心點
-                
-                # 原本片段的中心點
+                # 置中對齊
                 original_center = (original_start_ms + original_end_ms) / 2
-                
-                # 新片段的一半長度
                 half_new_duration = len(adjusted_audio) / 2
-                
-                # 計算新的開始時間 = 中心點 - 新片段的一半 + 手動延遲
                 final_position_ms = int(original_center)
-                
-                # 防呆：不能小於 0
                 final_position_ms = max(0, final_position_ms)
                 
-                # 4-7. 疊加 (Overlay)
+                # 疊加
                 final_audio = final_audio.overlay(adjusted_audio, position=final_position_ms)
 
             progress_bar.progress(100)
@@ -283,13 +257,13 @@ if audio_input is not None:
             final_audio.export(buffer, format="mp3")
             final_audio_bytes = buffer.getvalue()
             
-            st.subheader("🎧 淨化後的聲音")
+            st.subheader("🎧 淨化後的聲音 (保留原音)")
             st.audio(final_audio_bytes, format='audio/mpeg')
             
             st.download_button(
                 label="下載 MP3",
                 data=final_audio_bytes,
-                file_name="censored_remix.mp3",
+                file_name="censored_remix_ios.mp3",
                 mime="audio/mpeg"
             )
 
@@ -297,4 +271,3 @@ if audio_input is not None:
             st.error(f"發生錯誤: {str(e)}")
             import traceback
             st.code(traceback.format_exc())
-
